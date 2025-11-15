@@ -87,9 +87,13 @@ class SAC:
     def __init__(self, state_dim, action_dim, hidden_dim=256, lr=3e-3, gamma=0.99, tau=0.01, alpha=0.2, auto_entropy_tuning=True):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        self.actor = Actor(state_dim, action_dim, hidden_dim).to(self.device)
-        self.critic = Critic(state_dim, action_dim, hidden_dim).to(self.device)
-        self.critic_target = Critic(state_dim, action_dim, hidden_dim).to(self.device)
+        # Store number of discrete actions, but use continuous action_dim=1
+        self.n_actions = action_dim
+        continuous_action_dim = 1
+        
+        self.actor = Actor(state_dim, continuous_action_dim, hidden_dim).to(self.device)
+        self.critic = Critic(state_dim, continuous_action_dim, hidden_dim).to(self.device)
+        self.critic_target = Critic(state_dim, continuous_action_dim, hidden_dim).to(self.device)
         self.critic_target.load_state_dict(self.critic.state_dict())
         
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=lr)
@@ -101,28 +105,33 @@ class SAC:
         # Automatic entropy tuning
         self.auto_entropy_tuning = auto_entropy_tuning
         if self.auto_entropy_tuning:
-            self.target_entropy = -action_dim  # Heuristic value
+            self.target_entropy = -continuous_action_dim  # Heuristic value
             self.log_alpha = torch.zeros(1, requires_grad=True, device=self.device)
             self.alpha_optimizer = optim.Adam([self.log_alpha], lr=lr)
             self.alpha = self.log_alpha.exp().item()
         else:
             self.alpha = alpha
         
-        self.action_dim = action_dim
+        self.action_dim = continuous_action_dim
         
     def select_action(self, state, evaluate=False):
         state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
         if evaluate:
-            _, _, action = self.actor.sample(state)
+            _, _, continuous_action = self.actor.sample(state)
         else:
-            action, _, _ = self.actor.sample(state)
-        return action.detach().cpu().numpy()[0]
+            continuous_action, _, _ = self.actor.sample(state)
+        # Convert continuous action to discrete
+        continuous_action = continuous_action.detach().cpu().numpy()[0]
+        discrete_action = int((continuous_action[0] + 1) / 2 * (self.n_actions - 1))
+        discrete_action = np.clip(discrete_action, 0, self.n_actions - 1)
+        return discrete_action
     
     def update(self, replay_buffer, batch_size):
         state, action, reward, next_state, done = replay_buffer.sample(batch_size)
         
         state = torch.FloatTensor(state).to(self.device)
-        action = torch.FloatTensor(action).to(self.device)
+        # Convert discrete actions to continuous for the actor-critic
+        action_continuous = torch.FloatTensor([[(a / (self.n_actions - 1)) * 2 - 1] for a in action]).to(self.device)
         reward = torch.FloatTensor(reward).unsqueeze(1).to(self.device)
         next_state = torch.FloatTensor(next_state).to(self.device)
         done = torch.FloatTensor(done).unsqueeze(1).to(self.device)
@@ -133,7 +142,7 @@ class SAC:
             target_q = torch.min(target_q1, target_q2) - self.alpha * next_log_prob
             target_q = reward + (1 - done) * self.gamma * target_q
         
-        current_q1, current_q2 = self.critic(state, action)
+        current_q1, current_q2 = self.critic(state, action_continuous)
         critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(current_q2, target_q)
         
         self.critic_optimizer.zero_grad()
@@ -187,27 +196,13 @@ class FlattenObsWrapper(gym.ObservationWrapper):
     def observation(self, obs):
         return obs['image'].flatten()
 
-# Discrete to Continuous Action Wrapper
-class ContinuousActionWrapper(gym.ActionWrapper):
-    def __init__(self, env):
-        super().__init__(env)
-        self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
-        self.n_actions = env.action_space.n
-        
-    def action(self, action):
-        # Map continuous action to discrete action
-        continuous_action = np.clip(action[0], -1.0, 1.0)
-        discrete_action = int((continuous_action + 1) / 2 * (self.n_actions - 1))
-        return discrete_action
-
 def train():
     # Create 5x5 MiniGrid environment
     env = gym.make('MiniGrid-Empty-5x5-v0', render_mode=None)
     env = FlattenObsWrapper(env)
-    env = ContinuousActionWrapper(env)
     
     state_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.shape[0]
+    action_dim = env.action_space.n
     
     print(f"State dimension: {state_dim}")
     print(f"Action dimension: {action_dim}")
@@ -325,7 +320,6 @@ def train():
     print("Testing trained agent...")
     env = gym.make('MiniGrid-Empty-5x5-v0', render_mode='human')
     env = FlattenObsWrapper(env)
-    env = ContinuousActionWrapper(env)
     
     test_rewards = []
     test_lengths = []
@@ -369,7 +363,6 @@ def test_agent(agent=None, num_episodes=10, render=True):
     render_mode = 'human' if render else None
     env = gym.make('MiniGrid-Empty-5x5-v0', render_mode=render_mode)
     env = FlattenObsWrapper(env)
-    env = ContinuousActionWrapper(env)
     
     test_rewards = []
     test_lengths = []
